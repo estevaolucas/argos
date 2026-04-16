@@ -1,11 +1,14 @@
-import { ComponentProps, memo } from "react";
+import { ComponentProps, memo, useState } from "react";
 import clsx from "clsx";
 import {
+  CheckIcon,
   EllipsisIcon,
   RefreshCcwIcon,
+  SparklesIcon,
   ThumbsDownIcon,
   ThumbsUpIcon,
 } from "lucide-react";
+import { useClipboard } from "use-clipboard-copy";
 
 import { useIsLoggedIn } from "@/containers/Auth";
 import { BuildMergeQueueIndicator } from "@/containers/BuildMergeQueueIndicator";
@@ -18,11 +21,14 @@ import { DocumentType, graphql } from "@/gql";
 import { BuildMode, BuildType } from "@/gql/graphql";
 import { getProjectURL } from "@/pages/Project/ProjectParams";
 import { BrandShield } from "@/ui/BrandShield";
+import { Button } from "@/ui/Button";
 import { Chip } from "@/ui/Chip";
 import { HeadlessLink } from "@/ui/Link";
 import { Progress } from "@/ui/Progress";
 import { Tooltip } from "@/ui/Tooltip";
+import { useEventCallback } from "@/ui/useEventCallback";
 
+import { IconButton } from "../../../ui/IconButton";
 import { checkDiffCanBeReviewed, useBuildDiffState } from "../BuildDiffState";
 import {
   BuildReviewButton,
@@ -40,6 +46,7 @@ const _BuildFragment = graphql(`
     mergeQueue
     pullRequest {
       id
+      url
       ...PullRequestButton_PullRequest
     }
     ...BuildStatusChip_Build
@@ -155,7 +162,7 @@ function LoggedReviewButton(props: {
     };
   })();
   return (
-    <>
+    <div className="flex items-center gap-4">
       <Tooltip content={tooltip}>
         <div className="flex flex-col gap-1.5">
           <Chip scale="xs" color={color} className="tabular-nums" icon={icon}>
@@ -172,7 +179,7 @@ function LoggedReviewButton(props: {
         </div>
       </Tooltip>
       <BuildReviewButton project={props.project} />
-    </>
+    </div>
   );
 }
 
@@ -193,6 +200,139 @@ const _ProjectFragment = graphql(`
     ...BuildReviewButton_Project
   }
 `);
+
+function createBuildReviewPrompt(input: {
+  buildUrl: string;
+  pullRequest?: {
+    title?: string | null;
+    number: number;
+    url: string;
+    state?: string | null;
+    draft?: boolean | null;
+    merged?: boolean | null;
+    creator?: { login: string; name?: string | null } | null;
+  } | null;
+}) {
+  const pullRequest = input.pullRequest;
+  const prAuthor = pullRequest?.creator
+    ? pullRequest.creator.name
+      ? `${pullRequest.creator.name} (@${pullRequest.creator.login})`
+      : `@${pullRequest.creator.login}`
+    : null;
+
+  return [
+    "Review this Argos build and create the Argos build review.",
+    "",
+    "Prefer using $argos-pr-review if that skill is available. If it is not available, follow the workflow below directly.",
+    "",
+    "Inputs:",
+    `- Argos build: ${input.buildUrl}`,
+    `- Pull request: ${pullRequest ? pullRequest.url : "not linked in Argos"}`,
+    pullRequest?.title ? `- PR title: ${pullRequest.title}` : null,
+    pullRequest?.state ? `- PR state: ${pullRequest.state}` : null,
+    pullRequest?.draft != null
+      ? `- Draft: ${pullRequest.draft ? "yes" : "no"}`
+      : null,
+    pullRequest?.merged != null
+      ? `- Merged: ${pullRequest.merged ? "yes" : "no"}`
+      : null,
+    prAuthor ? `- PR author: ${prAuthor}` : null,
+    "",
+    "Before accessing external tools:",
+    "Ask the user for permission before using tools that may access private or sensitive data, including GitHub CLI/API, Jira, Linear, or any ticketing/project-management system. Explain which tools you want to use and why. Do not ask for permission to use the Argos CLI for this Argos build review; it is required for the task.",
+    "",
+    "Authentication:",
+    "The Argos CLI requires a token to read build data. Before running build inspection commands, check whether `ARGOS_TOKEN` is available in the environment or whether a token was provided with `--token`.",
+    "If no CLI token is available, ask the user to provide `ARGOS_TOKEN` or a `--token` value. If the user does not provide one, stop the process before running Argos CLI commands.",
+    "Creating an Argos build review requires a personal access token. Check whether it is stored in `~/.config/argos-ci/config.json` under the `token` field.",
+    "If the personal access token is not available, do not post the review on the Argos build. Finish by giving the review conclusion and evidence to the user instead, because CLI access is not sufficient to create the review.",
+    "Do not use project tokens for review creation.",
+    "",
+    "Goal:",
+    "Decide whether the Argos visual changes should be approved or rejected. Base the decision on the Argos build data, screenshots, visual diffs, the PR context, the code diff, and any linked ticket or issue that is accessible.",
+    "",
+    "Workflow:",
+    "1. Ensure a CLI token for build inspection is available from `ARGOS_TOKEN` or `--token`. If not, ask the user for one and stop if it is not provided.",
+    "2. Check whether a personal access token is available in `~/.config/argos-ci/config.json` for review submission.",
+    "3. Inspect the Argos build metadata first with the Argos CLI: `ARGOS_TOKEN=<token> argos build get <build-url> --json` or `argos build get <build-url> --token <token> --json`.",
+    "4. If the build is still pending or processing, stop and report that it cannot be reviewed yet. Do not approve an unfinished build.",
+    "5. Fetch only the diffs that need review with the Argos CLI: `ARGOS_TOKEN=<token> argos build snapshots <build-url> --needs-review --json` or `argos build snapshots <build-url> --token <token> --needs-review --json`.",
+    "6. If the Argos CLI is missing, cannot authenticate, or cannot access the build, stop and report the exact blocker. Do not submit a review from incomplete Argos data.",
+    "7. Group duplicate snapshots by Argos group/hash and inspect one representative per visual group unless browser-specific differences appear.",
+    "8. Inspect the PR context when a PR is available: title, description, labels/metadata, commits, changed files, code diff, tests, and comments that clarify intent.",
+    "9. Look for linked tickets or issues in the PR title, branch, description, comments, or commit messages. If accessible, read the ticket acceptance criteria, screenshots, design notes, and bug reports. If a ticket is not accessible, say so and continue with the evidence you have.",
+    "10. Form the intended user-facing change from the PR and ticket before judging the screenshots.",
+    "11. For each Argos diff, compare the base screenshot, head screenshot, and diff mask. Check whether the rendered change matches the intended change and whether the touched code plausibly explains it.",
+    "12. Pay special attention to regressions: missing content, wrong route, wrong state, clipped text, overlap, broken layout, unexpected loader/skeleton, theme mismatch, removed screenshots without matching test deletion, and content that contradicts the PR/ticket intent.",
+    "13. Check for flakiness: visible loading state, partial async data, animation mid-frame, dynamic values, retry metadata, or the same transient capture across browsers.",
+    "14. Make a binary Argos review decision: approve only when the visual changes are intentional and stable; request changes when there is a regression, unresolved flake, failed/aborted build, or insufficient evidence to safely approve.",
+    "",
+    "Output before submitting:",
+    "- Briefly summarize the PR/ticket intent you inferred.",
+    "- Summarize the Argos diffs reviewed, naming important snapshots.",
+    "- Explain the evidence for approval or for each requested change.",
+    "- State the exact conclusion you will submit: `approve` or `request-changes`.",
+    "",
+    "Submit the Argos review:",
+    "- Only submit the Argos review if a personal access token is available from `~/.config/argos-ci/config.json` or another explicit personal-token source.",
+    "- If everything is intentional and stable, run `argos build review <build-url> --token <personal-token> --conclusion approve --json`.",
+    "- If any visual regression or unresolved flake remains, run `argos build review <build-url> --token <personal-token> --conclusion request-changes --json`.",
+    "- If no personal access token is available, do not post the review on Argos. Give the user the conclusion, the evidence, and say that posting was skipped because the CLI does not have sufficient access.",
+    "- If blocked unexpectedly, report the exact command attempted, the exact error, and whether the token was missing, unreadable, rejected, or insufficiently privileged.",
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+function CopyBuildReviewPromptButton(props: {
+  buildNumber: number;
+  accountSlug: string;
+  projectName: string;
+  build: DocumentType<typeof _BuildFragment>;
+}) {
+  const clipboard = useClipboard({ copiedTimeout: 2000 });
+  const [isTooltipOpen, setIsTooltipOpen] = useState(false);
+  const buildPath = `${getProjectURL({
+    accountSlug: props.accountSlug,
+    projectName: props.projectName,
+  })}/builds/${props.buildNumber}`;
+  const buildUrl = new URL(buildPath, window.location.origin).toString();
+  const prompt = createBuildReviewPrompt({
+    buildUrl,
+    pullRequest: props.build.pullRequest,
+  });
+  const copy = () => {
+    clipboard.copy(prompt);
+  };
+
+  return (
+    <Tooltip
+      content={clipboard.copied ? "Copied!" : "Copy AI review prompt"}
+      isOpen={clipboard.copied || isTooltipOpen}
+      onOpenChange={setIsTooltipOpen}
+    >
+      <IconButton
+        variant="outline"
+        aria-label="Copy AI review prompt"
+        onPress={copy}
+      >
+        <span className="relative size-4 overflow-hidden">
+          <span
+            className={clsx(
+              "text-low absolute flex flex-col transition [&>svg]:size-4",
+              clipboard.copied && "-translate-y-4",
+            )}
+          >
+            <SparklesIcon
+              className={clsx("transition", clipboard.copied && "opacity-0")}
+            />
+            <CheckIcon />
+          </span>
+        </span>
+      </IconButton>
+    </Tooltip>
+  );
+}
 
 export const BuildHeader = memo(
   (props: {
@@ -241,9 +381,19 @@ export const BuildHeader = memo(
               <PullRequestButton pullRequest={build.pullRequest} size="small" />
             ) : null}
           </div>
-          {build && project && (
-            <ConditionalBuildReviewButton build={build} project={project} />
-          )}
+          <div className="flex items-center gap-1">
+            {build && project && (
+              <ConditionalBuildReviewButton build={build} project={project} />
+            )}
+            {build ? (
+              <CopyBuildReviewPromptButton
+                build={build}
+                buildNumber={props.buildNumber}
+                accountSlug={props.accountSlug}
+                projectName={props.projectName}
+              />
+            ) : null}
+          </div>
           <NavUserControl />
         </div>
       </div>
